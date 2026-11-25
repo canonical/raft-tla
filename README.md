@@ -1,8 +1,11 @@
 # Dqlite's TLA+ Raft spec and proof
 
 TLA+ specification of the Raft consensus algorithm based on Ongaro's original
-spec. The spec describes Raft with message passing and atomic actions which
-only read each replica's state.
+spec with membership changes as described in the dissertation (single-server)
+including the bug fix proposed in
+https://groups.google.com/g/raft-dev/c/t4xj6dJTP6E/m/d2D9LrWRza8J. The spec
+describes Raft with message passing and atomic actions which only read each
+replica's state.
 
 The repository contains a full safety proof for Raft plus some other interesting
 proven results.
@@ -10,9 +13,7 @@ proven results.
 ## Contents
 
 - `raft.tla`: the spec itself and safety invariants.
-- `proof_library.tla` and `proof_inductiveinvariant.tla`: shared lemmas and
-  the inductive invariant underlying the safety proofs.
-- The remaining `proof_*.tla` modules cover election safety, leader uniqueness,
+- The `proof_*.tla` modules cover election safety, leader uniqueness,
   log matching, term ordering, commit indices, quorum agreement, committed
   log consistency, and leader completeness.
 

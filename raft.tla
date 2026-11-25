@@ -18,16 +18,25 @@
 EXTENDS Naturals, FiniteSets, Sequences, SequenceTheorems, TLC, TLAPS,
         FiniteSetTheorems
 
-\* The set of server IDs
+\* The fixed universe of server IDs, including prospective and removed members.
 CONSTANTS Server
 ASSUME ServerOK == IsFiniteSet(Server) /\ Server # {}
+
+\* The voting membership before any entries have been appended.
+\* Voting configurations are nonempty; singleton clusters are permitted.
+CONSTANTS InitialConfig
+ASSUME InitialConfigOK ==
+    InitialConfig \in SUBSET Server /\ InitialConfig # {}
 
 \* A reserved value.
 CONSTANTS Nil
 ASSUME NilNotServer == Nil \notin Server
+\* A configuration is a set of server IDs, not itself a server ID.
+ASSUME NilNotConfig == \A config \in (SUBSET Server) \ { {} } : config # Nil
 
 \* The set of requests that can go into the log
 CONSTANTS Value
+ASSUME NilNotValue == Nil \notin Value
 
 \* Server states.
 CONSTANTS Follower, Candidate, Leader
@@ -69,7 +78,8 @@ VARIABLE votedFor
 \* log entry. Unfortunately, the Sequence module defines Head(s) as the entry
 \* with index 1, so be careful not to use that!
 VARIABLE log
-\* The index of the latest entry in the log the state machine may apply.
+\* The index of the latest committed entry. Only data at or below this index
+\* may be applied to the state machine; configuration parts take effect on append.
 VARIABLE commitIndex
 
 \* The following variables are used only on candidates:
@@ -95,9 +105,29 @@ vars == <<messages, currentTerm, state, votedFor, votesResponded, votesGranted, 
 ----
 \* Helpers
 
-\* The set of all quorums. This just calculates simple majorities, but the only
-\* important property is that every quorum overlaps with every other.
-Quorum == {i \in SUBSET(Server) : Cardinality(i) * 2 > Cardinality(Server)}
+\* Quorums are majorities of a particular configuration, not of all Server IDs.
+\* Adjacent configurations differ by one server and have overlapping quorums.
+\* Competing configurations need not have overlapping quorums.
+Quorums(config) ==
+    {q \in SUBSET config : Cardinality(q) * 2 > Cardinality(config)}
+
+\* Nil marks an absent part. Both parts may be absent for a no-op entry.
+ClientPayload ==
+    [value : {Nil} \cup Value,
+     members : {Nil} \cup ((SUBSET Server) \ { {} })]
+
+\* Only entries with a configuration part record a membership change.
+ConfigChangeIndexes(entries) ==
+    {index \in DOMAIN entries : entries[index].members # Nil}
+
+SingleChange(old, new) ==
+    \* The `\in` in this existential quantifier is only
+    \* there to make sure TLC can run.
+    \E member \in (old \cup new):
+        \/ /\ member \notin new
+           /\ old = new \cup { member }
+        \/ /\ member \notin old
+           /\ new = old \cup { member }
 
 \* The term of the last entry in a log, or 0 if the log is empty.
 LastTerm(xlog) == IF Len(xlog) = 0 THEN 0 ELSE xlog[Len(xlog)].term
@@ -115,6 +145,35 @@ Send(m) ==
 \* Local definitions of Min/Max (see SequencesExt).
 Min(s) == CHOOSE x \in s : \A y \in s : x <= y
 Max(s) == CHOOSE x \in s : \A y \in s : x >= y
+MaxOrZero(s) == IF s = {} THEN 0 ELSE Max(s)
+
+LastConfigChangeIndex(entries) == MaxOrZero(ConfigChangeIndexes(entries))
+
+\* The latest configuration part takes effect immediately, even when its entry
+\* is uncommitted. Truncating it restores the preceding configuration.
+ConfigOf(entries) ==
+    LET index == LastConfigChangeIndex(entries)
+    IN IF index = 0 THEN InitialConfig ELSE entries[index].members
+
+LastConfiguration(i) == ConfigOf(log[i])
+
+\* The current-term commit barrier fixes competing changes across terms.
+\* Under log-term monotonicity, a current-term committed entry exists exactly
+\* when the entry at commitIndex has the current term.
+CommittedInCurrentTerm(i) ==
+    IF commitIndex[i] \in DOMAIN log[i]
+    THEN log[i][commitIndex[i]].term = currentTerm[i]
+    ELSE FALSE
+
+CanReconfigure(i, new) ==
+    /\ state[i] = Leader
+    \* The leader may not remove itself.
+    /\ i \in new
+    /\ new \in SUBSET Server
+    /\ new # {}
+    /\ SingleChange(LastConfiguration(i), new)
+    /\ LastConfigChangeIndex(log[i]) <= commitIndex[i]
+    /\ CommittedInCurrentTerm(i)
 
 \* Local definition of IsPrefix (see SequencesExt).
 IsPrefix(prefix, fullLog) ==
@@ -162,18 +221,19 @@ RequestVoteRequests(i, requestTerm) ==
        mlastLogTerm |-> LastTerm(log[i]),
        mlastLogIndex |-> Len(log[i]),
        msource |-> i,
-       mdest |-> j] : j \in Server \ { i } }
+       mdest |-> j] : j \in LastConfiguration(i) \ { i } }
 
 \* Server i times out and starts a new election, sending a request vote
-\* to all its peers.
+\* to its current members. Removed servers may still campaign, but only votes
+\* from the candidate's own configuration count toward election.
 Timeout(i) ==
     /\ state[i] \in { Follower, Candidate }
     /\ state' = [state EXCEPT ![i] = Candidate]
     /\ currentTerm' = [currentTerm EXCEPT ![i] = currentTerm[i] + 1]
-    \* Vote for self atomically when starting an election.
+    \* Vote for self atomically, counting it only if i is a current member.
     /\ votedFor' = [votedFor EXCEPT ![i] = i]
     /\ votesResponded' = [votesResponded EXCEPT ![i] = { i }]
-    /\ votesGranted' = [votesGranted EXCEPT ![i] = { i }]
+    /\ votesGranted' = [votesGranted EXCEPT ![i] = { i } \cap LastConfiguration(i)]
     /\ messages' = WithMessages(
         messages, RequestVoteRequests(i, currentTerm[i] + 1))
     /\ UNCHANGED (* leaderVars *) <<nextIndex, matchIndex>>
@@ -208,6 +268,7 @@ AppendEntriesMessage(i, j) ==
 AppendEntries(i, j) ==
     /\ i /= j
     /\ state[i] = Leader
+    /\ j \in LastConfiguration(i)
     /\ Send(AppendEntriesMessage(i, j))
     /\ UNCHANGED (* serverVars *) <<currentTerm, state, votedFor>>
     /\ UNCHANGED (* candidateVars *) <<votesResponded, votesGranted>>
@@ -217,7 +278,7 @@ AppendEntries(i, j) ==
 \* Candidate i transitions to leader.
 BecomeLeader(i) ==
     /\ state[i] = Candidate
-    /\ votesGranted[i] \in Quorum
+    /\ (votesGranted[i] \cap LastConfiguration(i)) \in Quorums(LastConfiguration(i))
     /\ state'      = [state EXCEPT ![i] = Leader]
     /\ nextIndex'  = [nextIndex EXCEPT ![i] =
                          [j \in Server |-> Len(log[i]) + 1]]
@@ -227,13 +288,27 @@ BecomeLeader(i) ==
     /\ UNCHANGED (* candidateVars *) <<votesResponded, votesGranted>>
     /\ UNCHANGED (* logVars *) <<log, commitIndex>>
 
-\* Leader i receives a client request to add v to the log.
-ClientRequest(i, v) ==
+\* Leader i appends a data entry, a configuration change, both, or a no-op.
+\* A configuration change requires a current-term commit and no uncommitted
+\* prior change. It takes effect on append; data becomes visible on commit.
+ClientRequest(i, payload) ==
     /\ state[i] = Leader
-    /\ LET entry == [term  |-> currentTerm[i],
-                     value |-> v]
-           newLog == Append(log[i], entry)
-       IN  log' = [log EXCEPT ![i] = newLog]
+    /\ payload \in ClientPayload
+    /\ IF payload.members = Nil THEN TRUE ELSE CanReconfigure(i, payload.members)
+    /\ log' = [log EXCEPT ![i] = Append(log[i], [term |-> currentTerm[i],
+                                                value |-> payload.value,
+                                                members |-> payload.members])]
+    /\ UNCHANGED <<messages, commitIndex>>
+    /\ UNCHANGED (* serverVars *) <<currentTerm, state, votedFor>>
+    /\ UNCHANGED (* candidateVars *) <<votesResponded, votesGranted>>
+    /\ UNCHANGED (* leaderVars *) <<nextIndex, matchIndex>>
+
+\* Reverts the effects of a client request, including its resulting membership.
+\* This can only be used right after
+\* a ClientRequest action.
+AbortClientRequest(i) ==
+    /\ state[i] = Leader
+    /\ log' = [log EXCEPT ![i] = SubSeq(log[i], 1, Len(log[i]) - 1)]
     /\ UNCHANGED <<messages, commitIndex>>
     /\ UNCHANGED (* serverVars *) <<currentTerm, state, votedFor>>
     /\ UNCHANGED (* candidateVars *) <<votesResponded, votesGranted>>
@@ -243,10 +318,12 @@ ClientRequest(i, v) ==
 \* This is done as a separate step from handling AppendEntries responses,
 \* in part to minimize atomic regions, and in part so that leaders of
 \* single-server clusters are able to mark entries committed.
-Agree(i, index) == { i } \cup {k \in Server: matchIndex[i][k] >= index}
+Agree(i, index) ==
+    {k \in LastConfiguration(i): k = i \/ matchIndex[i][k] >= index}
 
 AgreeIndexes(i) ==
-    {index \in 1 .. Len(log[i]): Agree(i, index) \in Quorum}
+    {index \in 1 .. Len(log[i]):
+        Agree(i, index) \in Quorums(LastConfiguration(i))}
 
 NewCommitIndex(i) ==
   IF /\ AgreeIndexes(i) /= {}
@@ -283,6 +360,8 @@ LeaderStepDown(i) ==
 
 \* Server i receives a RequestVote request from server j with
 \* m.mterm <= currentTerm[i].
+\* Recipients process RPCs regardless of either server's local membership.
+\* The caller's configuration determines which responses form a quorum.
 HandleRequestVoteRequest(i, j, m) ==
     LET logOk == \/ m.mlastLogTerm > LastTerm(log[i])
                  \/ /\ m.mlastLogTerm = LastTerm(log[i])
@@ -407,7 +486,7 @@ HandleMsg(i, j, m) ==
        \/ /\ m.mtype = AppendEntriesResponse
           /\ HandleAppendEntriesResponse(i, j, m)
 
-\* Receive a message.
+\* Receive a message regardless of either server's current configuration.
 Receive(m) ==
     LET i == m.mdest
         j == m.msource
@@ -423,7 +502,7 @@ Next ==
   \/ \E i \in Server : Restart(i)
   \/ \E i \in Server : Timeout(i)
   \/ \E i \in Server : BecomeLeader(i)
-  \/ \E i \in Server, v \in Value : ClientRequest(i, v)
+  \/ \E i \in Server, payload \in ClientPayload : ClientRequest(i, payload)
   \/ \E i \in Server : AdvanceCommitIndex(i)
   \/ \E i,j \in Server : AppendEntries(i, j)
   \/ \E i \in Server : LeaderStepDown(i)
@@ -437,7 +516,8 @@ Spec == Init /\ [][Next]_vars
 
 \* Exact record types for log entries and in-flight messages.
 LogEntry ==
-    [term : Nat, value : Value]
+    [term : Nat, value : {Nil} \cup Value,
+     members : {Nil} \cup ((SUBSET Server) \ { {} })]
 
 RequestVoteRequestMessage ==
     [mtype         : {RequestVoteRequest},
@@ -513,7 +593,14 @@ SendInvariant ==
 \* Helper functions:
 \* The prefix of the log of server i that has been committed.
 Committed(i) == SubSeq(log[i],1,commitIndex[i])
-MaxOrZero(s) == IF s = {} THEN 0 ELSE Max(s)
+
+\* Entries without data contribute nothing, even after they are committed.
+DataValues(entries) ==
+    LET dataEntries == SelectSeq(entries, LAMBDA entry: entry.value # Nil)
+    IN [index \in 1..Len(dataEntries) |-> dataEntries[index].value]
+
+CommittedData(i) == DataValues(Committed(i))
+
 CurrentLeaders == {i \in Server : state[i] = Leader}
 
 \* Committed log entries should never conflict between servers.
@@ -551,12 +638,11 @@ LogMatchingInv ==
             log[i][n].term = log[j][n].term =>
             SubSeq(log[i],1,n) = SubSeq(log[j],1,n)
 
-\* All committed entries are contained in the log of at least one server in
-\* every quorum.
-\* See https://github.com/etcd-io/raft/blob/195edd62dbd6d9c9c2d11342b0476ecd64e7ca6f/tla/etcdraft.tla#L838.
+\* A server's committed prefix intersects every quorum of its own latest
+\* configuration. Obsolete configurations need not contain later commits.
 QuorumLogInv ==
     \A i \in Server:
-    \A S \in Quorum:
+    \A S \in Quorums(LastConfiguration(i)):
         \E j \in S :
             IsPrefix(Committed(i), log[j])
 
